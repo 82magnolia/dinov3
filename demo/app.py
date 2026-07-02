@@ -28,11 +28,24 @@ MODEL_OPTIONS = {
     "ViT-L/16 (best quality)": ("dinov3_vitl16", 24),
 }
 
+PRETRAINED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrained")
+
 _model_cache: dict = {}
 
 
 def _get_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _scan_pretrained() -> list[str]:
+    """Return full paths of all .pth files inside demo/pretrained/, sorted by name."""
+    if not os.path.isdir(PRETRAINED_DIR):
+        return []
+    return sorted(
+        os.path.join(PRETRAINED_DIR, f)
+        for f in os.listdir(PRETRAINED_DIR)
+        if f.endswith(".pth")
+    )
 
 
 def _load_model(model_name: str, weights_path: str):
@@ -41,8 +54,7 @@ def _load_model(model_name: str, weights_path: str):
         if not weights_path or not os.path.isfile(weights_path):
             raise gr.Error(
                 f"Weights file not found: '{weights_path}'. "
-                "Please request access at https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/ "
-                "and provide the path to the downloaded .pth file."
+                "Drop a .pth file into demo/pretrained/ and click Refresh."
             )
         device = _get_device()
         repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -107,7 +119,7 @@ def run_matching(
         raise gr.Error("Please upload both a left and a right image.")
 
     model_name, n_layers = MODEL_OPTIONS[model_choice]
-    model, device = _load_model(model_name, weights_path.strip())
+    model, device = _load_model(model_name, weights_path or "")
 
     feat_l = _extract_features(model, image_left, n_layers, device)   # [D, H1, W1]
     feat_r = _extract_features(model, image_right, n_layers, device)  # [D, H2, W2]
@@ -215,8 +227,8 @@ dense and sparse visual correspondences without any task-specific fine-tuning.
 * **Dense**: patches are coloured by their position in PCA feature space — matching patches share the same colour.
 
 > **Note**: DINOv3 weights are gated by Meta. Request access at
-> [ai.meta.com/resources/models-and-libraries/dinov3-downloads](https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/)
-> and paste the local `.pth` path below.
+> [ai.meta.com/resources/models-and-libraries/dinov3-downloads](https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/),
+> download the `.pth` file, place it in `demo/pretrained/`, then click **Refresh**.
 """
 
 with gr.Blocks(title="DINOv3 Keypoint Matching", theme=gr.themes.Soft()) as demo:
@@ -250,10 +262,20 @@ with gr.Blocks(title="DINOv3 Keypoint Matching", theme=gr.themes.Soft()) as demo
             value=60,
         )
 
-    weights_tb = gr.Textbox(
-        label="Path to weights (.pth)",
-        placeholder="/path/to/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-        info="Local path to the downloaded DINOv3 checkpoint. Must match the selected model architecture.",
+    with gr.Row():
+        weights_dd = gr.Dropdown(
+            label="Weights (demo/pretrained/)",
+            choices=_scan_pretrained(),
+            value=(_scan_pretrained() or [None])[0],
+            info="Place .pth files in demo/pretrained/ and click Refresh to list them.",
+            scale=5,
+        )
+        refresh_btn = gr.Button("Refresh", scale=1)
+
+    refresh_btn.click(
+        fn=lambda: gr.Dropdown(choices=_scan_pretrained(), value=(_scan_pretrained() or [None])[0]),
+        inputs=[],
+        outputs=[weights_dd],
     )
 
     run_btn = gr.Button("Find Correspondences", variant="primary")
@@ -264,7 +286,7 @@ with gr.Blocks(title="DINOv3 Keypoint Matching", theme=gr.themes.Soft()) as demo
 
     run_btn.click(
         fn=run_matching,
-        inputs=[img_left, img_right, model_dd, weights_tb, n_pts_sl],
+        inputs=[img_left, img_right, model_dd, weights_dd, n_pts_sl],
         outputs=[sparse_out, dense_out],
     )
 
