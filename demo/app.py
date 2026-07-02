@@ -1,12 +1,15 @@
 import os
 import sys
 
+import cv2
 import gradio as gr
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
+from scipy.interpolate import RBFInterpolator
+from scipy.ndimage import map_coordinates
 from sklearn.decomposition import PCA
 import matplotlib
 matplotlib.use("Agg")
@@ -19,7 +22,6 @@ PATCH_SIZE = 16
 IMAGE_SIZE = 448
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-STRATIFY_DISTANCE_THRESHOLD = 60.0
 
 MODEL_OPTIONS = {
     "ViT-S/16 (fastest)": ("dinov3_vits16", 12),
@@ -80,9 +82,8 @@ def _resize(image: Image.Image) -> torch.Tensor:
 def _extract_features(model, image: Image.Image, n_layers: int, device: str) -> torch.Tensor:
     img = _resize(image.convert("RGB"))
     img = TF.normalize(img, mean=IMAGENET_MEAN, std=IMAGENET_STD).unsqueeze(0).to(device)
-    dtype = torch.float32
     with torch.inference_mode():
-        with torch.autocast(device_type=device.split(":")[0], dtype=dtype):
+        with torch.autocast(device_type=device.split(":")[0], dtype=torch.float32):
             feats = model.get_intermediate_layers(img, n=range(n_layers), reshape=True, norm=True)
     return feats[-1].squeeze().detach().cpu()  # [D, H, W]
 
@@ -114,6 +115,7 @@ def run_matching(
     model_choice: str,
     weights_path: str,
     num_points: int,
+    stratify_threshold: float,
 ):
     if image_left is None or image_right is None:
         raise gr.Error("Please upload both a left and a right image.")
@@ -128,7 +130,6 @@ def run_matching(
     feat_l_n = F.normalize(feat_l, p=2, dim=0)
     feat_r_n = F.normalize(feat_r, p=2, dim=0)
 
-    # For each left patch find the best-matching right patch
     heatmaps = torch.einsum(
         "k f, f h w -> k h w",
         feat_l_n.view(dim, -1).T,   # [N1, D]
@@ -140,11 +141,10 @@ def run_matching(
     n1 = h1 * w1
 
     idx_l = torch.arange(n1)
-    # patch-centre pixel coords in the resized image
-    locs_l = (torch.stack([idx_l // w1, idx_l % w1], dim=-1).float() + 0.5) * PATCH_SIZE  # [N1, 2]
+    locs_l = (torch.stack([idx_l // w1, idx_l % w1], dim=-1).float() + 0.5) * PATCH_SIZE  # [N1, 2] (row,col) resized
 
     idx_r = heatmaps.flatten(-2).argmax(-1)  # [N1]
-    locs_r = (torch.stack([idx_r // w2, idx_r % w2], dim=-1).float() + 0.5) * PATCH_SIZE  # [N1, 2]
+    locs_r = (torch.stack([idx_r // w2, idx_r % w2], dim=-1).float() + 0.5) * PATCH_SIZE  # [N1, 2] (row,col) resized
 
     # ---------- PCA colour map ----------
     x_l = feat_l.view(dim, -1).T.numpy()   # [N1, D]
@@ -170,19 +170,29 @@ def run_matching(
     da2.axis("off")
     plt.tight_layout()
 
-    # ---------- Sparse figure ----------
+    # ---------- Sparse selection ----------
     scale_l = image_left.height / IMAGE_SIZE
     scale_r = image_right.height / IMAGE_SIZE
 
-    keep = _stratify_points(locs_l * scale_l, STRATIFY_DISTANCE_THRESHOLD ** 2)
+    keep = _stratify_points(locs_l * scale_l, stratify_threshold ** 2)
     if len(keep) > num_points:
         rng = np.random.default_rng(42)
         keep = np.sort(rng.choice(keep, size=num_points, replace=False))
 
-    pts_l = locs_l[keep].numpy()   # [K, 2]  (row, col) in resized space
+    pts_l = locs_l[keep].numpy()   # [K, 2] (row, col) in resized space
     pts_r = locs_r[keep].numpy()
 
-    # colour from PCA map
+    # Convert to original image pixel space and store for RANSAC stage
+    pts_l_orig = pts_l * scale_l   # [K, 2] (row, col) original px
+    pts_r_orig = pts_r * scale_r
+    new_match_state = {
+        "pts_l": pts_l_orig,
+        "pts_r": pts_r_orig,
+        "img_left": image_left,
+        "img_right": image_right,
+    }
+
+    # ---------- Sparse figure ----------
     ri = (pts_l[:, 0] / PATCH_SIZE).astype(int).clip(0, h1 - 1)
     ci = (pts_l[:, 1] / PATCH_SIZE).astype(int).clip(0, w1 - 1)
     colors = rgb_l[:, ri, ci].T.numpy()  # [K, 3]
@@ -211,7 +221,117 @@ def run_matching(
         sa2.plot(xr, yr, "o", color=color, markersize=4)
 
     plt.tight_layout()
-    return fig_sparse, fig_dense
+    return fig_sparse, fig_dense, new_match_state
+
+
+def fit_and_warp(state: dict, transform_type: str, reproj_threshold: float):
+    if state is None or state.get("pts_l") is None:
+        raise gr.Error("Run 'Find Correspondences' first.")
+
+    pts_l_rc = state["pts_l"]    # [K, 2] (row, col) float64, original px
+    pts_r_rc = state["pts_r"]    # [K, 2] (row, col) float64, original px
+    img_left  = state["img_left"]
+    img_right = state["img_right"]
+
+    K = len(pts_l_rc)
+    img_left_np  = np.array(img_left.convert("RGB"))   # H1 x W1 x 3 uint8
+    img_right_np = np.array(img_right.convert("RGB"))  # H2 x W2 x 3 uint8
+
+    # cv2 uses (x,y) = (col,row) and float32
+    pts_l_xy = pts_l_rc[:, ::-1].astype(np.float32)
+    pts_r_xy = pts_r_rc[:, ::-1].astype(np.float32)
+    dsize = (img_right.width, img_right.height)  # cv2 (width, height)
+    h2, w2 = img_right.height, img_right.width
+
+    if transform_type == "Affine":
+        M, mask = cv2.estimateAffine2D(
+            pts_l_xy, pts_r_xy,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=reproj_threshold,
+        )
+        if M is None:
+            raise gr.Error("Affine RANSAC failed — too few or degenerate matches.")
+        inlier_count = int(mask.sum())
+        warped = cv2.warpAffine(img_left_np, M, dsize)
+
+    elif transform_type == "Homography":
+        H, mask = cv2.findHomography(
+            pts_l_xy, pts_r_xy,
+            cv2.RANSAC,
+            ransacReprojThreshold=reproj_threshold,
+        )
+        if H is None:
+            raise gr.Error("Homography RANSAC failed — too few or degenerate matches.")
+        inlier_count = int(mask.sum())
+        warped = cv2.warpPerspective(img_left_np, H, dsize)
+
+    elif transform_type in ("RBF (Affine init)", "RBF (Homography init)"):
+        if transform_type == "RBF (Affine init)":
+            M_init, mask = cv2.estimateAffine2D(
+                pts_l_xy, pts_r_xy,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=reproj_threshold,
+            )
+        else:
+            M_init, mask = cv2.findHomography(
+                pts_l_xy, pts_r_xy,
+                cv2.RANSAC,
+                ransacReprojThreshold=reproj_threshold,
+            )
+        if M_init is None or mask is None:
+            raise gr.Error(f"{transform_type} RANSAC (inlier selection for RBF) failed.")
+        inlier_bool = mask.ravel().astype(bool)
+        inlier_count = int(inlier_bool.sum())
+        if inlier_count < 4:
+            raise gr.Error(f"Too few inliers ({inlier_count}) to fit RBF — need at least 4.")
+
+        pts_l_in = pts_l_rc[inlier_bool]   # [I, 2] (row, col)
+        pts_r_in = pts_r_rc[inlier_bool]   # [I, 2] (row, col)
+
+        # Inverse mapping: for each right-image pixel, where does it come from in left?
+        rbf = RBFInterpolator(
+            pts_r_in,
+            pts_l_in - pts_r_in,   # displacement: right -> left
+            kernel="thin_plate_spline",
+        )
+
+        rows = np.arange(h2, dtype=np.float64)
+        cols = np.arange(w2, dtype=np.float64)
+        grid_col, grid_row = np.meshgrid(cols, rows)   # H2 x W2 each
+        query_rc = np.column_stack([grid_row.ravel(), grid_col.ravel()])  # [H2*W2, 2]
+
+        disp = rbf(query_rc)   # [H2*W2, 2] (delta_row, delta_col)
+        src_row = query_rc[:, 0] + disp[:, 0]
+        src_col = query_rc[:, 1] + disp[:, 1]
+
+        warped = np.stack([
+            map_coordinates(
+                img_left_np[:, :, c],
+                [src_row, src_col],
+                order=1,
+                mode="nearest",
+            ).reshape(h2, w2)
+            for c in range(3)
+        ], axis=-1).astype(np.uint8)
+
+    else:
+        raise gr.Error(f"Unknown transform type: {transform_type}")
+
+    inlier_text = f"{inlier_count} / {K} inliers"
+    # Return warped twice: once for display, once for warped_state
+    return warped, warped, inlier_text
+
+
+def blend_images(warped_state, img_right: Image.Image, alpha: float):
+    if warped_state is None or img_right is None:
+        return None
+    right_np = np.array(img_right.convert("RGB"))
+    blended = np.clip(
+        alpha * warped_state.astype(np.float32)
+        + (1.0 - alpha) * right_np.astype(np.float32),
+        0, 255,
+    ).astype(np.uint8)
+    return blended
 
 
 # ─────────────────────────── Gradio UI ───────────────────────────
@@ -225,6 +345,7 @@ dense and sparse visual correspondences without any task-specific fine-tuning.
 
 * **Sparse**: coloured lines connect matched keypoints between the two images.
 * **Dense**: patches are coloured by their position in PCA feature space — matching patches share the same colour.
+* **Geometric Warp**: fit an Affine, Homography, or RBF warp via RANSAC and overlay the result.
 
 > **Note**: DINOv3 weights are gated by Meta. Request access at
 > [ai.meta.com/resources/models-and-libraries/dinov3-downloads](https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/),
@@ -233,6 +354,9 @@ dense and sparse visual correspondences without any task-specific fine-tuning.
 
 with gr.Blocks(title="DINOv3 Keypoint Matching", theme=gr.themes.Soft()) as demo:
     gr.Markdown(DESCRIPTION)
+
+    match_state  = gr.State(value=None)
+    warped_state = gr.State(value=None)
 
     with gr.Row():
         img_left = gr.Image(
@@ -259,7 +383,14 @@ with gr.Blocks(title="DINOv3 Keypoint Matching", theme=gr.themes.Soft()) as demo
             minimum=10,
             maximum=200,
             step=10,
-            value=60,
+            value=100,
+        )
+        stratify_sl = gr.Slider(
+            label="Stratify threshold (px)",
+            minimum=10,
+            maximum=200,
+            step=5,
+            value=20,
         )
 
     with gr.Row():
@@ -284,10 +415,51 @@ with gr.Blocks(title="DINOv3 Keypoint Matching", theme=gr.themes.Soft()) as demo
     with gr.Accordion("Dense Correspondences (PCA colour map)", open=False):
         dense_out = gr.Plot(label="Dense Correspondences")
 
+    with gr.Accordion("Geometric Warp (RANSAC)", open=False):
+        with gr.Row():
+            transform_dd = gr.Dropdown(
+                label="Transform type",
+                choices=["Affine", "Homography", "RBF (Affine init)", "RBF (Homography init)"],
+                value="Affine",
+            )
+            fit_btn = gr.Button("Fit & Warp", variant="primary")
+        reproj_sl = gr.Slider(
+            label="RANSAC reprojection threshold (px)",
+            minimum=1.0,
+            maximum=50.0,
+            step=0.5,
+            value=3.0,
+        )
+        inlier_txt = gr.Textbox(label="Inlier count", interactive=False)
+        alpha_sl = gr.Slider(
+            label="Blend  (1 = warped left,  0 = right only)",
+            minimum=0.0,
+            maximum=1.0,
+            step=0.05,
+            value=0.5,
+        )
+        warp_img_out = gr.Image(
+            label="Warped Left overlaid on Right",
+            type="numpy",
+            interactive=False,
+        )
+
     run_btn.click(
         fn=run_matching,
-        inputs=[img_left, img_right, model_dd, weights_dd, n_pts_sl],
-        outputs=[sparse_out, dense_out],
+        inputs=[img_left, img_right, model_dd, weights_dd, n_pts_sl, stratify_sl],
+        outputs=[sparse_out, dense_out, match_state],
+    )
+
+    fit_btn.click(
+        fn=fit_and_warp,
+        inputs=[match_state, transform_dd, reproj_sl],
+        outputs=[warp_img_out, warped_state, inlier_txt],
+    )
+
+    alpha_sl.change(
+        fn=blend_images,
+        inputs=[warped_state, img_right, alpha_sl],
+        outputs=[warp_img_out],
     )
 
 if __name__ == "__main__":
